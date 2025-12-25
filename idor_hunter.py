@@ -22,9 +22,6 @@ import json
 
 class BurpExtender(IBurpExtender, IHttpListener, ITab, IMessageEditorController):
 
-    #
-    # ========== BURP REGISTRATION ==========
-    #
     def registerExtenderCallbacks(self, callbacks):
         self.callbacks = callbacks
         self.helpers = callbacks.getHelpers()
@@ -41,11 +38,10 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab, IMessageEditorController)
         self._build_ui()
         callbacks.addSuiteTab(self)
 
-        print("[+] IDOR Hunter loaded")
+        print("[+] IDOR Hunter loaded successfully")
 
-    #
-    # ========== UI ==========
-    #
+    # ================= UI ================= #
+
     def _build_ui(self):
         self.main_panel = JPanel(BorderLayout())
 
@@ -70,7 +66,10 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab, IMessageEditorController)
         )
         split.setResizeWeight(0.5)
 
-        export_btn = JButton("Export Findings (JSON)", actionPerformed=self._export)
+        export_btn = JButton(
+            "Export Findings (JSON)",
+            actionPerformed=self._export
+        )
 
         self.main_panel.add(export_btn, BorderLayout.NORTH)
         self.main_panel.add(table_scroll, BorderLayout.CENTER)
@@ -82,9 +81,8 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab, IMessageEditorController)
     def getUiComponent(self):
         return self.main_panel
 
-    #
-    # ========== MESSAGE EDITOR ==========
-    #
+    # ========== IMessageEditorController ========= #
+
     def getHttpService(self):
         return self.current_request.getHttpService()
 
@@ -94,9 +92,8 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab, IMessageEditorController)
     def getResponse(self):
         return self.current_response
 
-    #
-    # ========== HTTP LISTENER ==========
-    #
+    # ================= Listener ================= #
+
     def processHttpMessage(self, toolFlag, messageIsRequest, messageInfo):
         if messageIsRequest:
             return
@@ -113,9 +110,10 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab, IMessageEditorController)
             return
 
         body = self._get_body(request)
+
         ids = set()
         ids.update(self._extract_ids(url + body))
-        ids.update(self._extract_graphql_ids(body))
+        ids.update(self._extract_json_ids(body))
 
         for oid in ids:
             mid = self._mutate_id(oid)
@@ -130,25 +128,17 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab, IMessageEditorController)
                 attack_req
             )
 
-            self._analyze(
-                messageInfo,
-                resp,
-                url,
-                oid,
-                mid
-            )
+            self._analyze(messageInfo, resp, url, oid, mid)
+            break  # safety: only one mutation per request
 
-            break  # single mutation per request (safety)
+    # ================= Analysis ================= #
 
-    #
-    # ========== ANALYSIS ==========
-    #
     def _analyze(self, original, mutated, url, oid, mid):
         o_resp = original.getResponse()
         m_resp = mutated.getResponse()
 
         delta = abs(len(o_resp) - len(m_resp))
-        if delta < 40:
+        if delta < 10:
             return
 
         severity = self._score_severity(m_resp, delta)
@@ -171,16 +161,15 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab, IMessageEditorController)
             severity
         ])
 
-        print("[!] IDOR suspected:", url, oid, "→", mid)
+        print("[!] Potential IDOR:", url, oid, "→", mid)
 
-    #
-    # ========== SEVERITY ==========
-    #
+    # ================= Severity ================= #
+
     def _score_severity(self, response, delta):
         text = self.helpers.bytesToString(response).lower()
         sensitive = [
-            "email", "phone", "address", "role",
-            "balance", "token", "account", "admin"
+            "email", "phone", "address",
+            "role", "balance", "account", "admin"
         ]
 
         hits = sum(1 for s in sensitive if s in text)
@@ -191,18 +180,32 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab, IMessageEditorController)
             return "Medium"
         return "Low"
 
-    #
-    # ========== ID EXTRACTION ==========
-    #
+    # ================= ID Extraction ================= #
+
     def _extract_ids(self, text):
-        nums = re.findall(r"/(\d{2,})", text)
-        uuids = re.findall(
+        ids = []
+
+        # 1. Path-based numeric IDs (/users/123456)
+        ids += re.findall(r"/(\d{2,7})", text)
+
+        # 2. Query/body parameters (*_id=123456)
+        ids += re.findall(
+            r"(?:^|[?&\"'])"
+            r"(?:[a-zA-Z0-9_]*_id|id)"
+            r"[\"']?\s*[:=]\s*[\"']?(\d{2,7})",
+            text,
+            re.IGNORECASE
+        )
+
+        # 3. UUIDs
+        ids += re.findall(
             r"[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}",
             text.lower()
         )
-        return nums + uuids
 
-    def _extract_graphql_ids(self, body):
+        return list(set(ids))
+
+    def _extract_json_ids(self, body):
         ids = []
 
         try:
@@ -211,8 +214,9 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab, IMessageEditorController)
             def walk(obj):
                 if isinstance(obj, dict):
                     for k, v in obj.items():
-                        if k.lower() in ["id", "userid", "objectid"]:
-                            ids.append(str(v))
+                        if isinstance(v, int) and 2 <= len(str(v)) <= 7:
+                            if k.lower().endswith("_id") or k.lower() == "id":
+                                ids.append(str(v))
                         walk(v)
                 elif isinstance(obj, list):
                     for i in obj:
@@ -224,27 +228,31 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab, IMessageEditorController)
 
         return ids
 
+    # ================= Mutation ================= #
+
     def _mutate_id(self, oid):
         try:
             if oid.isdigit():
                 return str(int(oid) + 1)
             if "-" in oid:
-                p = oid.split("-")
-                p[-1] = p[-1][::-1]
-                return "-".join(p)
+                parts = oid.split("-")
+                parts[-1] = parts[-1][::-1]
+                return "-".join(parts)
         except:
             return None
 
-    #
-    # ========== UTIL ==========
-    #
+    # ================= Utils ================= #
+
     def _get_body(self, request):
         info = self.helpers.analyzeRequest(request)
-        return self.helpers.bytesToString(request[info.getBodyOffset():])
+        return self.helpers.bytesToString(
+            request[info.getBodyOffset():]
+        )
 
     def _is_static(self, url):
         return any(url.endswith(x) for x in [
-            ".js", ".css", ".png", ".jpg", ".svg", ".woff"
+            ".js", ".css", ".png", ".jpg",
+            ".svg", ".woff", ".ico"
         ])
 
     def _is_safe_endpoint(self, url):
@@ -254,17 +262,14 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab, IMessageEditorController)
         ]
         return not any(x in url for x in blacklist)
 
-    #
-    # ========== UI EVENTS ==========
-    #
+    # ================= UI ================= #
+
     def _on_row_select(self):
         row = self.table.getSelectedRow()
         if row < 0:
             return
 
         finding = self.findings[row]
-        self.current_request = None
-        self.current_response = None
 
         self.current_request = DummyRequest(
             finding["request"],
@@ -272,16 +277,17 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab, IMessageEditorController)
         )
         self.current_response = finding["response"]
 
-        self.req_viewer.setMessage(finding["request"], True)
-        self.res_viewer.setMessage(finding["response"], False)
+        self.req_viewer.setMessage(
+            finding["request"], True
+        )
+        self.res_viewer.setMessage(
+            finding["response"], False
+        )
 
     def _export(self, event):
         print(json.dumps(self.findings, indent=2))
 
 
-#
-# Dummy request wrapper
-#
 class DummyRequest(object):
     def __init__(self, req, svc):
         self.req = req
@@ -292,4 +298,3 @@ class DummyRequest(object):
 
     def getHttpService(self):
         return self.svc
-
