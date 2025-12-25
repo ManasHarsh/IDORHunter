@@ -7,10 +7,11 @@ from javax.swing.event import ListSelectionListener
 from java.awt import BorderLayout
 import re
 import json
+import hashlib
 
 
 # =========================
-# Row selection listener
+# Table selection listener
 # =========================
 class RowSelectionListener(ListSelectionListener):
     def __init__(self, extender):
@@ -22,7 +23,7 @@ class RowSelectionListener(ListSelectionListener):
 
 
 # =========================
-# Main Burp Extension
+# Main Extension
 # =========================
 class BurpExtender(IBurpExtender, IHttpListener, ITab, IMessageEditorController):
 
@@ -30,7 +31,7 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab, IMessageEditorController)
         self.callbacks = callbacks
         self.helpers = callbacks.getHelpers()
         callbacks.setExtensionName(
-            "IDOR Hunter – Behavioral Object Access Analyzer"
+            "IDOR Hunter – Universal Behavioral Analyzer"
         )
 
         callbacks.registerHttpListener(self)
@@ -42,7 +43,7 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab, IMessageEditorController)
         self._build_ui()
         callbacks.addSuiteTab(self)
 
-        print("[+] IDOR Hunter loaded cleanly")
+        print("[+] IDOR Hunter (universal) loaded cleanly")
 
     # ================= UI ================= #
 
@@ -50,15 +51,13 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab, IMessageEditorController)
         self.panel = JPanel(BorderLayout())
 
         self.model = DefaultTableModel(
-            ["URL", "Original ID", "Mutated ID", "Δ Length", "Severity"], 0
+            ["URL", "Parameter", "Original", "Mutated", "Severity"], 0
         )
 
         self.table = JTable(self.model)
         self.table.getSelectionModel().addListSelectionListener(
             RowSelectionListener(self)
         )
-
-        table_scroll = JScrollPane(self.table)
 
         self.req_viewer = self.callbacks.createMessageEditor(self, True)
         self.res_viewer = self.callbacks.createMessageEditor(self, False)
@@ -76,7 +75,7 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab, IMessageEditorController)
         )
 
         self.panel.add(export_btn, BorderLayout.NORTH)
-        self.panel.add(table_scroll, BorderLayout.CENTER)
+        self.panel.add(JScrollPane(self.table), BorderLayout.CENTER)
         self.panel.add(split, BorderLayout.SOUTH)
 
     def getTabCaption(self):
@@ -112,190 +111,138 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab, IMessageEditorController)
             if not response:
                 return
 
-            resp_info = self.helpers.analyzeResponse(response)
-            mime = resp_info.getStatedMimeType().lower()
-
-            # Skip binary responses
-            if mime not in ["json", "html", "xml"]:
-                return
-
             req_info = self.helpers.analyzeRequest(request)
-            url = req_info.getUrl().toString().lower()
+            url = req_info.getUrl().toString()
 
             if self._is_static(url) or not self._is_safe_endpoint(url):
                 return
 
             body = self._get_body(request)
-            if not body or len(body) > 100000:
+            req_str = self.helpers.bytesToString(request)
+
+            params = self._extract_id_params(req_str)
+            if not params:
                 return
 
-            ids = set()
-            try:
-                ids.update(self._extract_ids(url + body))
-                ids.update(self._extract_json_ids(body))
-            except:
-                return
-
-            for oid in ids:
-                mid = self._mutate_id(oid)
-                if not mid or mid == oid:
+            for param, value in params:
+                mutated_value = self._mutate_numeric(value)
+                if not mutated_value:
                     continue
 
-                new_req = self.helpers.bytesToString(request).replace(oid, mid)
-                attack_req = self.helpers.stringToBytes(new_req)
+                mutated_req = self._mutate_param(req_str, param, value, mutated_value)
+                if not mutated_req:
+                    continue
 
+                attack_req = self.helpers.stringToBytes(mutated_req)
                 resp = self.callbacks.makeHttpRequest(
                     messageInfo.getHttpService(),
                     attack_req
                 )
 
-                self._analyze(messageInfo, resp, url, oid, mid)
-                break  # safety: single mutation
+                self._analyze(messageInfo, resp, url, param, value, mutated_value)
+                break  # single mutation (safety)
 
         except:
             return
 
     # ================= Analysis ================= #
 
-    def _analyze(self, original, mutated, url, oid, mid):
+    def _analyze(self, original, mutated, url, param, old, new):
         try:
             o_resp = original.getResponse()
             m_resp = mutated.getResponse()
             if not m_resp:
                 return
 
-            delta = abs(len(o_resp) - len(m_resp))
-            if delta < 10:
-                return
+            o_body = self.helpers.bytesToString(o_resp)
+            m_body = self.helpers.bytesToString(m_resp)
 
-            severity = self._score_severity(m_resp, delta)
+            if self._fingerprint(o_body) == self._fingerprint(m_body):
+                return  # no behavioral difference
+
+            severity = self._score_severity(m_body)
 
             self.findings.append({
                 "url": url,
-                "original_id": oid,
-                "mutated_id": mid,
-                "delta": delta,
+                "parameter": param,
+                "original": old,
+                "mutated": new,
                 "severity": severity,
                 "request": mutated.getRequest(),
                 "response": m_resp
             })
 
-            self.model.addRow([
-                url,
-                oid,
-                mid,
-                delta,
-                severity
-            ])
+            self.model.addRow([url, param, old, new, severity])
 
-            print("[!] Potential IDOR:", url, oid, "→", mid)
+            print("[!] Potential IDOR:", url, param, old, "→", new)
 
         except:
             return
 
-    # ================= Severity ================= #
+    # ================= Universal Heuristics ================= #
 
-    def _score_severity(self, response, delta):
-        text = self.helpers.bytesToString(response).lower()
-        sensitive = [
-            "email", "phone", "address",
-            "role", "balance", "account", "admin"
-        ]
+    def _extract_id_params(self, text):
+        results = []
 
-        hits = 0
-        for s in sensitive:
-            if s in text:
-                hits += 1
-
-        if hits >= 2 and delta > 200:
-            return "High"
-        if hits >= 1:
-            return "Medium"
-        return "Low"
-
-    # ================= ID Extraction ================= #
-
-    def _extract_ids(self, text):
-        ids = []
-
-        # Path-based numeric IDs
-        ids += re.findall(r"/(\d{2,7})", text)
-
-        # *_id or id parameters (query/body)
-        ids += re.findall(
-            r"(?:^|[?&\"'])"
-            r"(?:[a-zA-Z0-9_]*_id|id)"
-            r"\s*[:=]\s*[\"']?(\d{2,7})",
-            text,
+        # Matches: id=123, user_id=123, processor_id=123 (2–7 digits)
+        pattern = re.compile(
+            r'([a-zA-Z0-9_]*_id|id)\s*=\s*["\']?(\d{2,7})',
             re.IGNORECASE
         )
 
-        # UUIDs
-        ids += re.findall(
-            r"[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}",
-            text.lower()
+        for match in pattern.findall(text):
+            results.append(match)
+
+        return list(set(results))
+
+    def _mutate_param(self, req, param, old, new):
+        pattern = re.compile(
+            r'(' + re.escape(param) + r'\s*=\s*)' + re.escape(old),
+            re.IGNORECASE
         )
 
-        return list(set(ids))
+        mutated, count = pattern.subn(r'\1' + new, req, 1)
+        if count == 0:
+            return None
+        return mutated
 
-    def _extract_json_ids(self, body):
-        ids = []
-
+    def _mutate_numeric(self, value):
         try:
-            data = json.loads(body)
-
-            def walk(obj):
-                if isinstance(obj, dict):
-                    for k, v in obj.items():
-                        if isinstance(v, int):
-                            if 2 <= len(str(v)) <= 7:
-                                if k.lower().endswith("_id") or k.lower() == "id":
-                                    ids.append(str(v))
-                        walk(v)
-                elif isinstance(obj, list):
-                    for i in obj:
-                        walk(i)
-
-            walk(data)
-        except:
-            pass
-
-        return ids
-
-    # ================= Mutation ================= #
-
-    def _mutate_id(self, oid):
-        try:
-            if oid.isdigit():
-                return str(int(oid) + 1)
-            if "-" in oid:
-                parts = oid.split("-")
-                parts[-1] = parts[-1][::-1]
-                return "-".join(parts)
+            return str(int(value) + 1)
         except:
             return None
+
+    def _fingerprint(self, body):
+        # Content fingerprinting (universal)
+        cleaned = re.sub(r'\s+', '', body)
+        return hashlib.md5(cleaned.encode('utf-8')).hexdigest()
+
+    def _score_severity(self, body):
+        body = body.lower()
+        sensitive = ["email", "phone", "address", "account", "role", "admin"]
+        hits = sum(1 for s in sensitive if s in body)
+
+        if hits >= 2:
+            return "High"
+        if hits == 1:
+            return "Medium"
+        return "Low"
 
     # ================= Utils ================= #
 
     def _get_body(self, request):
         info = self.helpers.analyzeRequest(request)
-        return self.helpers.bytesToString(
-            request[info.getBodyOffset():]
-        )
+        return self.helpers.bytesToString(request[info.getBodyOffset():])
 
     def _is_static(self, url):
-        return any(url.endswith(x) for x in [
-            ".js", ".css", ".png", ".jpg",
-            ".svg", ".woff", ".ico"
+        return any(url.lower().endswith(x) for x in [
+            ".js", ".css", ".png", ".jpg", ".svg", ".woff", ".ico"
         ])
 
     def _is_safe_endpoint(self, url):
-        blacklist = [
-            "logout", "delete", "remove",
-            "payment", "transfer", "reset"
-        ]
+        blacklist = ["logout", "delete", "remove", "payment", "transfer", "reset"]
         for x in blacklist:
-            if x in url:
+            if x in url.lower():
                 return False
         return True
 
@@ -307,27 +254,19 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab, IMessageEditorController)
             return
 
         finding = self.findings[row]
-
         self.current_request = DummyRequest(
             finding["request"],
             self.callbacks.getHttpService()
         )
         self.current_response = finding["response"]
 
-        self.req_viewer.setMessage(
-            finding["request"], True
-        )
-        self.res_viewer.setMessage(
-            finding["response"], False
-        )
+        self.req_viewer.setMessage(finding["request"], True)
+        self.res_viewer.setMessage(finding["response"], False)
 
     def _export(self, event):
         print(json.dumps(self.findings, indent=2))
 
 
-# =========================
-# Dummy request wrapper
-# =========================
 class DummyRequest(object):
     def __init__(self, req, svc):
         self.req = req
