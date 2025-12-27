@@ -30,6 +30,7 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab, IMessageEditorController)
     def registerExtenderCallbacks(self, callbacks):
         self.callbacks = callbacks
         self.helpers = callbacks.getHelpers()
+
         callbacks.setExtensionName(
             "IDOR Hunter – Universal Behavioral Analyzer"
         )
@@ -43,7 +44,7 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab, IMessageEditorController)
         self._build_ui()
         callbacks.addSuiteTab(self)
 
-        print("[+] IDOR Hunter (universal) loaded cleanly")
+        print("[+] IDOR Hunter (final universal version) loaded")
 
     # ================= UI ================= #
 
@@ -117,30 +118,41 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab, IMessageEditorController)
             if self._is_static(url) or not self._is_safe_endpoint(url):
                 return
 
-            body = self._get_body(request)
-            req_str = self.helpers.bytesToString(request)
-
-            params = self._extract_id_params(req_str)
+            # Extract numeric parameters universally
+            params = self._extract_generic_numeric_params(request)
             if not params:
                 return
+
+            req_str = self.helpers.bytesToString(request)
 
             for param, value in params:
                 mutated_value = self._mutate_numeric(value)
                 if not mutated_value:
                     continue
 
-                mutated_req = self._mutate_param(req_str, param, value, mutated_value)
+                mutated_req = self._mutate_param(
+                    req_str, param, value, mutated_value
+                )
                 if not mutated_req:
                     continue
 
                 attack_req = self.helpers.stringToBytes(mutated_req)
+
                 resp = self.callbacks.makeHttpRequest(
                     messageInfo.getHttpService(),
                     attack_req
                 )
 
-                self._analyze(messageInfo, resp, url, param, value, mutated_value)
-                break  # single mutation (safety)
+                self._analyze(
+                    messageInfo,
+                    resp,
+                    url,
+                    param,
+                    value,
+                    mutated_value
+                )
+
+                break  # single mutation per request (safety)
 
         except:
             return
@@ -157,8 +169,9 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab, IMessageEditorController)
             o_body = self.helpers.bytesToString(o_resp)
             m_body = self.helpers.bytesToString(m_resp)
 
+            # Behavioral fingerprint comparison
             if self._fingerprint(o_body) == self._fingerprint(m_body):
-                return  # no behavioral difference
+                return
 
             severity = self._score_severity(m_body)
 
@@ -172,26 +185,49 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab, IMessageEditorController)
                 "response": m_resp
             })
 
-            self.model.addRow([url, param, old, new, severity])
+            self.model.addRow([
+                url,
+                param,
+                old,
+                new,
+                severity
+            ])
 
             print("[!] Potential IDOR:", url, param, old, "→", new)
 
         except:
             return
 
-    # ================= Universal Heuristics ================= #
+    # ================= Universal Logic ================= #
 
-    def _extract_id_params(self, text):
+    def _extract_generic_numeric_params(self, request):
+        """
+        Extract ANY parameter with numeric value (1–7 digits),
+        regardless of parameter name.
+        """
         results = []
 
-        # Matches: id=123, user_id=123, processor_id=123 (2–7 digits)
-        pattern = re.compile(
-            r'([a-zA-Z0-9_]*_id|id)\s*=\s*["\']?(\d{2,7})',
-            re.IGNORECASE
-        )
+        try:
+            req_info = self.helpers.analyzeRequest(request)
+            for p in req_info.getParameters():
+                if p.getType() in [
+                    self.helpers.PARAM_URL,
+                    self.helpers.PARAM_BODY
+                ]:
+                    name = p.getName()
+                    value = p.getValue()
 
-        for match in pattern.findall(text):
-            results.append(match)
+                    if value.isdigit() and 1 <= len(value) <= 7:
+                        # Skip obvious non-object params
+                        if name.lower() in [
+                            "page", "limit", "offset", "count",
+                            "size", "tab", "step", "sort"
+                        ]:
+                            continue
+
+                        results.append((name, value))
+        except:
+            pass
 
         return list(set(results))
 
@@ -213,13 +249,16 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab, IMessageEditorController)
             return None
 
     def _fingerprint(self, body):
-        # Content fingerprinting (universal)
+        # Normalize whitespace before hashing
         cleaned = re.sub(r'\s+', '', body)
         return hashlib.md5(cleaned.encode('utf-8')).hexdigest()
 
     def _score_severity(self, body):
         body = body.lower()
-        sensitive = ["email", "phone", "address", "account", "role", "admin"]
+        sensitive = [
+            "email", "phone", "address",
+            "account", "role", "admin", "secret"
+        ]
         hits = sum(1 for s in sensitive if s in body)
 
         if hits >= 2:
@@ -230,17 +269,17 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab, IMessageEditorController)
 
     # ================= Utils ================= #
 
-    def _get_body(self, request):
-        info = self.helpers.analyzeRequest(request)
-        return self.helpers.bytesToString(request[info.getBodyOffset():])
-
     def _is_static(self, url):
         return any(url.lower().endswith(x) for x in [
-            ".js", ".css", ".png", ".jpg", ".svg", ".woff", ".ico"
+            ".js", ".css", ".png", ".jpg",
+            ".svg", ".woff", ".ico"
         ])
 
     def _is_safe_endpoint(self, url):
-        blacklist = ["logout", "delete", "remove", "payment", "transfer", "reset"]
+        blacklist = [
+            "logout", "delete", "remove",
+            "payment", "transfer", "reset"
+        ]
         for x in blacklist:
             if x in url.lower():
                 return False
@@ -260,13 +299,20 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab, IMessageEditorController)
         )
         self.current_response = finding["response"]
 
-        self.req_viewer.setMessage(finding["request"], True)
-        self.res_viewer.setMessage(finding["response"], False)
+        self.req_viewer.setMessage(
+            finding["request"], True
+        )
+        self.res_viewer.setMessage(
+            finding["response"], False
+        )
 
     def _export(self, event):
         print(json.dumps(self.findings, indent=2))
 
 
+# =========================
+# Dummy request wrapper
+# =========================
 class DummyRequest(object):
     def __init__(self, req, svc):
         self.req = req
